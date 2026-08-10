@@ -300,6 +300,7 @@ td.num{text-align:right; font-family:'SF Mono',Menlo,monospace; font-variant-num
 <div class="toast" id="toast"></div>
 <div class="print-only" id="printSheet"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 /* ============ Utilities ============ */
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
@@ -356,17 +357,33 @@ let currentUser = null;
 let currentRole = null;   // in-memory only — logging out or reloading clears this by design
 
 async function loadAuth(){
-  AUTH = await Promise.race([
-    loadKey('auth', {users:[]}),
-    new Promise(resolve=>setTimeout(()=>resolve({users:[]}), 10000))
-  ]);
-  if(!AUTH.users) AUTH.users=[];
-  // Existing logins created before roles were added remain full-access admins.
-  AUTH.users = AUTH.users.map(u => ({...u, role: u.role || 'ADMIN'}));
+  // Read auth directly so a Supabase read error is never mistaken for
+  // an empty auth record (which incorrectly shows "Create the first login").
+  try{
+    const { data, error } = await sb.from('khata_data')
+      .select('value')
+      .eq('key','auth')
+      .maybeSingle();
+    if(error){
+      console.error('AUTH LOAD ERROR:', error);
+      AUTH = {users:[]};
+      window.__AUTH_LOAD_ERROR = error.message || String(error);
+      return;
+    }
+    AUTH = (data && data.value && typeof data.value === 'object') ? data.value : {users:[]};
+    if(!Array.isArray(AUTH.users)) AUTH.users=[];
+    AUTH.users = AUTH.users.map(u => ({...u, role: u.role || 'ADMIN'}));
+    window.__AUTH_LOAD_ERROR = '';
+  }catch(e){
+    console.error('AUTH LOAD ERROR:', e);
+    AUTH = {users:[]};
+    window.__AUTH_LOAD_ERROR = e.message || String(e);
+  }
 }
 async function saveAuth(){
   try{
-    await saveKey('auth');
+    const { error } = await sb.from('khata_data').upsert({ key:'auth', value: AUTH, updated_at: new Date().toISOString() });
+    if(error){ console.error('auth save failed', error); toast('Could not save login — check connection'); }
   }catch(e){ console.error('auth save failed', e); toast('Could not save login — check connection'); }
 }
 
@@ -385,6 +402,10 @@ function renderAuthGate(){
   document.getElementById('tabbar').style.display='none';
   renderTopbarRight();
   const app = document.getElementById('app');
+  if(window.__AUTH_LOAD_ERROR){
+    app.innerHTML = `<div class="card"><h2>Database connection error</h2><p class="small">The existing login record could not be read from Supabase.</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere;">${esc(window.__AUTH_LOAD_ERROR)}</pre><button class="btn-primary" onclick="location.reload()">Retry</button></div>`;
+    return;
+  }
   if(!AUTH.users || AUTH.users.length===0){ app.innerHTML = viewSetupAdmin(); return; }
   if(!currentUser){ app.innerHTML = viewLogin(); return; }
   startApp();
@@ -460,139 +481,26 @@ async function startApp(){
   render();
 }
 
-/* ============ Storage layer (Supabase relational tables) ============ */
+/* ============ Storage layer (Supabase) ============ */
 const SUPABASE_URL = 'https://hksdwjsnumadwnkdxeyt.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhrc2R3anNudW1hZHdua2R4ZXl0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyOTY0OTUsImV4cCI6MjEwMTg3MjQ5NX0.kihbdysOL_sDqA1Dwt-SyLJiATCqd8nSj6qTLSSHY2I';
-// Lightweight Supabase REST client. This avoids depending on an external
-// supabase-js CDN, which may not execute when an HTML file is opened from
-// iPhone Files/Quick Look.
-class RestQuery {
-  constructor(table){ this.table=table; this.method='GET'; this.params=[]; this.body=null; this.headers={}; this.single=false; }
-  select(columns='*'){ this.method='GET'; this.select=columns; return this; }
-  eq(column,value){ this.params.push([column,'eq.'+String(value)]); return this; }
-  neq(column,value){ this.params.push([column,'neq.'+String(value)]); return this; }
-  in(column,values){ this.params.push([column,'in.('+values.map(v=>`"${String(v).replace(/"/g,'\\"')}"`).join(',')+')']); return this; }
-  order(column,opts={}){ this.params.push(['order',column+(opts.ascending===false?'.desc':'.asc')]); return this; }
-  maybeSingle(){ this.single=true; return this; }
-  insert(rows){ this.method='POST'; this.body=rows; this.headers['Prefer']='return=representation'; return this; }
-  upsert(row){ this.method='POST'; this.body=row; this.headers['Prefer']='resolution=merge-duplicates,return=representation'; return this; }
-  delete(){ this.method='DELETE'; return this; }
-  then(resolve,reject){ return this.run().then(resolve,reject); }
-  catch(reject){ return this.run().catch(reject); }
-  async run(){
-    const url=new URL(SUPABASE_URL+'/rest/v1/'+encodeURIComponent(this.table));
-    if(this.method==='GET') url.searchParams.set('select',this.select||'*');
-    for(const [k,v] of this.params) url.searchParams.append(k,v);
-    const headers={
-      apikey:SUPABASE_ANON_KEY,
-      Authorization:'Bearer '+SUPABASE_ANON_KEY,
-      ...this.headers
-    };
-    if(this.method==='POST') headers['Content-Type']='application/json';
-    try{
-      const res=await fetch(url.toString(),{method:this.method,headers,body:this.method==='POST'?JSON.stringify(this.body):undefined});
-      const text=await res.text();
-      let data=null; try{ data=text?JSON.parse(text):null; }catch{}
-      if(!res.ok) return {data:null,error:{message:(data&&data.message)||text||res.statusText,status:res.status}};
-      if(this.single) data=Array.isArray(data)?(data[0]||null):data;
-      return {data,error:null};
-    }catch(e){ return {data:null,error:{message:e.message||String(e)}}; }
-  }
-}
-const sb={from(table){return new RestQuery(table);}};
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const KEYS = ['meta','employees','entries','attendance','timelog','products','customers','quotations','advances','approvalMatrix','payroll'];
 let DB = {};
 
-/* The UI keeps the same DB[key] objects it used before, but persistence is now
-   normalized into PostgreSQL tables instead of the old khata_data JSON blob. */
-function rowify(key, x){
-  if(key==='employees') return {id:x.id,emp_id:x.empId,name:x.name,designation:x.designation||'',department:x.department||'',location:x.location||'',date_of_joining:x.dateOfJoining||null,manager:x.manager||'',salary:Number(x.salary)||0,status:x.status||'Active'};
-  if(key==='entries') return {id:x.id,entry_date:x.date||null,item:x.item||'',nature:x.nature||'',sales_qty:Number(x.salesQty)||0,sales_rate:Number(x.salesRate)||0,customer_status:x.custStatus||'',purchase_qty:Number(x.purQty)||0,purchase_rate:Number(x.purRate)||0,vendor_status:x.vendStatus||'',promo_pct:Number(x.promoPct)||0,source_account:x.sourceAccount||''};
-  if(key==='attendance') return {id:x.id,attendance_date:x.date||null,employee_id:x.empId,status:x.status};
-  if(key==='timelog') return {id:x.id,log_date:x.date||null,employee_id:x.empId,check_in:x.checkIn||null,approval:x.approval||''};
-  if(key==='products') return {id:x.id,name:x.name,type:x.type||'',description:x.desc||'',hsn:x.hsn||'',unit:x.unit||'',rate:Number(x.rate)||0,gst:Number(x.gst)||0};
-  if(key==='customers') return {id:x.id,name:x.name||'',billing_address:x.address||'',gstin:x.gstin||'',contact_person:x.contactPerson||'',contact:x.contact||'',email:x.email||''};
-  if(key==='advances') return {id:x.id,type:x.type,request_date:x.date||null,employee_id:x.empId,category:x.category||'',description:x.description||'',bill_no:x.billNo||'',amount:Number(x.amount)||0,payment_mode:x.paymentMode||'',deduct_from_salary:!!x.deductFromSalary,approval_status:x.approvalStatus||'Pending',approved_amount:x.approvedAmount??null,approved_by:x.approvedBy||null,approval_date:x.approvalDate||null,notes:x.notes||''};
-  if(key==='approvalMatrix') return {id:x.id,request_type:x.reqType||'',category:x.category||'',min_amount:Number(x.min)||0,max_amount:Number(x.max)||0,primary_approver:x.primary||'',secondary_approver:x.secondary||'',required_docs:x.docs||'',turnaround:x.turnaround||'',escalation:x.escalation||'',notes:x.notes||''};
-  if(key==='payroll') return {id:x.id,employee_id:x.empId,month:x.month,status:x.status||'Pending'};
-  return x;
-}
-function unrow(key, r){
-  if(key==='employees') return {id:r.id,empId:r.emp_id,name:r.name,designation:r.designation,department:r.department,location:r.location,dateOfJoining:r.date_of_joining,manager:r.manager,salary:Number(r.salary)||0,status:r.status};
-  if(key==='entries') return {id:r.id,date:r.entry_date,item:r.item,nature:r.nature,salesQty:Number(r.sales_qty)||0,salesRate:Number(r.sales_rate)||0,custStatus:r.customer_status,purQty:Number(r.purchase_qty)||0,purRate:Number(r.purchase_rate)||0,vendStatus:r.vendor_status,promoPct:Number(r.promo_pct)||0,sourceAccount:r.source_account||''};
-  if(key==='attendance') return {id:r.id,date:r.attendance_date,empId:r.employee_id,status:r.status};
-  if(key==='timelog') return {id:r.id,date:r.log_date,empId:r.employee_id,checkIn:r.check_in||'',approval:r.approval||''};
-  if(key==='products') return {id:r.id,name:r.name,type:r.type,desc:r.description||'',hsn:r.hsn,unit:r.unit,rate:Number(r.rate)||0,gst:Number(r.gst)||0};
-  if(key==='customers') return {id:r.id,name:r.name,address:r.billing_address||'',gstin:r.gstin,contactPerson:r.contact_person||'',contact:r.contact,email:r.email};
-  if(key==='advances') return {id:r.id,type:r.type,date:r.request_date,empId:r.employee_id,category:r.category,description:r.description,billNo:r.bill_no,amount:Number(r.amount)||0,paymentMode:r.payment_mode,deductFromSalary:!!r.deduct_from_salary,approvalStatus:r.approval_status,approvedAmount:r.approved_amount==null?undefined:Number(r.approved_amount),approvedBy:r.approved_by||undefined,approvalDate:r.approval_date||undefined,notes:r.notes};
-  if(key==='approvalMatrix') return {id:r.id,reqType:r.request_type,category:r.category,min:Number(r.min_amount)||0,max:Number(r.max_amount)||0,primary:r.primary_approver,secondary:r.secondary_approver||'',docs:r.required_docs,turnaround:r.turnaround,escalation:r.escalation,notes:r.notes};
-  if(key==='payroll') return {id:r.id,empId:r.employee_id,month:r.month,status:r.status};
-  return r;
-}
-
 async function loadKey(key, fallback){
   try{
-    if(key==='auth'){
-      const {data,error}=await sb.from('app_users').select('username,salt,password_hash,role').order('username');
-      if(error) throw error;
-      return {users:(data||[]).map(u=>({username:u.username,salt:u.salt,hash:u.password_hash,role:u.role||'ADMIN'}))};
-    }
-    if(key==='meta'){
-      const [{data:m,error:me},{data:ba,error:be}]=await Promise.all([
-        sb.from('company_meta').select('*').eq('id',1).maybeSingle(),
-        sb.from('bank_accounts').select('name,opening_balance').order('name')
-      ]);
-      if(me) throw me; if(be) throw be;
-      if(!m) return fallback;
-      const accounts=(ba||[]).map(x=>x.name), opening={}; (ba||[]).forEach(x=>opening[x.name]=Number(x.opening_balance)||0);
-      return {gstRate:Number(m.gst_rate)||0,promoRate:Number(m.promo_rate)||0,workingDays:Number(m.working_days)||26,accounts,opening,quoteSeq:Number(m.quote_seq)||1,companyGstin:m.company_gstin||''};
-    }
-    if(key==='quotations'){
-      const {data:q,error}=await sb.from('quotations').select('*').order('quote_date',{ascending:false}); if(error) throw error;
-      const ids=(q||[]).map(x=>x.id); let items=[];
-      if(ids.length){ const r=await sb.from('quotation_items').select('*').in('quotation_id',ids); if(r.error) throw r.error; items=r.data||[]; }
-      return (q||[]).map(x=>({...x,id:x.id,quoteNo:x.quote_no,date:x.quote_date,validUntil:x.valid_until||'',gstMode:x.gst_mode||'CGST_SGST',preparedBy:x.prepared_by||'',customerId:x.customer_id||'',customerName:x.customer_name||'',status:x.status,taxable:Number(x.taxable)||0,gst:Number(x.gst)||0,grandTotal:Number(x.grand_total)||0,items:items.filter(i=>i.quotation_id===x.id).map(i=>({productId:i.product_id,name:i.name,desc:i.description||'',hsn:i.hsn||'',unit:i.unit||'',qty:Number(i.qty)||0,rate:Number(i.rate)||0,gst:Number(i.gst)||0}))}));
-    }
-    const table={employees:'employees',entries:'ledger_entries',attendance:'attendance',timelog:'time_logs',products:'products',customers:'customers',advances:'advances_claims',approvalMatrix:'approval_matrix',payroll:'payroll_status'}[key];
-    if(!table) return fallback;
-    const {data,error}=await sb.from(table).select('*'); if(error) throw error;
-    return (data||[]).map(r=>unrow(key,r));
-  }catch(e){ console.error('load failed',key,e); return fallback; }
+    const { data, error } = await sb.from('khata_data').select('value').eq('key', key).maybeSingle();
+    if(error){ console.error('load failed', key, error); return fallback; }
+    return (data && data.value != null) ? data.value : fallback;
+  }catch(e){ console.error('load failed', key, e); return fallback; }
 }
-
 async function saveKey(key){
   try{
-    if(key==='auth'){
-      await sb.from('app_users').delete().neq('username','');
-      const rows=(AUTH.users||[]).map(u=>({username:u.username,salt:u.salt,password_hash:u.hash,role:u.role||'ADMIN'}));
-      if(rows.length){ const r=await sb.from('app_users').insert(rows); if(r.error) throw r.error; }
-      return;
-    }
-    if(key==='meta'){
-      const m=DB.meta||{};
-      let r=await sb.from('company_meta').upsert({id:1,gst_rate:Number(m.gstRate)||0,promo_rate:Number(m.promoRate)||0,working_days:Number(m.workingDays)||26,quote_seq:Number(m.quoteSeq)||1,company_gstin:m.companyGstin||'',updated_at:new Date().toISOString()});
-      if(r.error) throw r.error;
-      await sb.from('bank_accounts').delete().neq('name','');
-      const rows=(m.accounts||[]).map(name=>({name,opening_balance:Number((m.opening||{})[name])||0}));
-      if(rows.length){r=await sb.from('bank_accounts').insert(rows); if(r.error) throw r.error;}
-      return;
-    }
-    if(key==='quotations'){
-      await sb.from('quotation_items').delete().neq('id','');
-      await sb.from('quotations').delete().neq('id','');
-      const qs=(DB.quotations||[]).map(q=>({id:q.id,quote_no:q.quoteNo?parseInt(String(q.quoteNo).replace(/\D/g,''))||null:null,customer_id:q.customerId||null,customer_name:q.customerName||'',quote_date:q.date||null,valid_until:q.validUntil||null,gst_mode:q.gstMode||'CGST_SGST',prepared_by:q.preparedBy||'',status:q.status||'Quoted',taxable:Number(q.taxable)||0,gst:Number(q.gst)||0,grand_total:Number(q.grandTotal)||0}));
-      if(qs.length){let r=await sb.from('quotations').insert(qs);if(r.error)throw r.error;}
-      const its=[];(DB.quotations||[]).forEach(q=>(q.items||[]).forEach(i=>its.push({id:uid(),quotation_id:q.id,product_id:i.productId||null,name:i.name||'',description:i.desc||'',hsn:i.hsn||'',unit:i.unit||'',qty:Number(i.qty)||0,rate:Number(i.rate)||0,gst:Number(i.gst)||0})));
-      if(its.length){let r=await sb.from('quotation_items').insert(its);if(r.error)throw r.error;}
-      return;
-    }
-    const table={employees:'employees',entries:'ledger_entries',attendance:'attendance',timelog:'time_logs',products:'products',customers:'customers',advances:'advances_claims',approvalMatrix:'approval_matrix',payroll:'payroll_status'}[key];
-    if(!table) return;
-    let r=await sb.from(table).delete().neq('id',''); if(r.error) throw r.error;
-    const rows=(DB[key]||[]).map(x=>rowify(key,x));
-    if(rows.length){ r=await sb.from(table).insert(rows); if(r.error) throw r.error; }
-  }catch(e){ console.error('save failed',key,e); toast('Save failed — check SQL tables / permissions'); }
+    const { error } = await sb.from('khata_data').upsert({ key, value: DB[key], updated_at: new Date().toISOString() });
+    if(error){ console.error('save failed', key, error); toast('Save failed — check connection'); }
+  }catch(e){ console.error('save failed', key, e); toast('Save failed — check connection'); }
 }
 
 function seedData(){
@@ -609,39 +517,37 @@ function seedData(){
       {id:uid(),empId:'EMP008',name:'Mr. Nilesh Verma',designation:'Executive',department:'SUPPORT',manager:'Narendra Shukla',salary:18000,status:'Active'},
       {id:uid(),empId:'EMP009',name:'Mr. Sanjay Singh',designation:'Executive',department:'ADMIN',manager:'Narendra Shukla',salary:15000,status:'Active'},
     ],
-    entries: [], attendance: [], timelog: [],
-    products: [{id:uid(),name:'Cybernetyx EyeRISH86" 4K UHD',type:'Product',desc:'400 nits LED, 2x20W SPK, IR Touch 20pt, Android 14, 8GB/128GB, wall mount / WiFi, 3yr warranty',hsn:'8471',unit:'Units',rate:150200,gst:0.18}],
-    customers: [], quotations: [], advances: [],
+    entries: [],
+    attendance: [],
+    timelog: [],
+    products: [
+      {id:uid(),name:'Cybernetyx EyeRISH86" 4K UHD',type:'Product',desc:'400 nits LED, 2x20W SPK, IR Touch 20pt, Android 14, 8GB/128GB, wall mount / WiFi, 3yr warranty',hsn:'8471',unit:'Units',rate:150200,gst:0.18},
+    ],
+    customers: [],
+    quotations: [],
+    advances: [],
     approvalMatrix: [
       {id:uid(),reqType:'Employee Advance',category:'General Advance',min:0,max:10000,primary:'Narendra Shukla',secondary:'',docs:'Request form',turnaround:'1 Working Day',escalation:'Virendra Tripathi',notes:'Routine employee advance'},
       {id:uid(),reqType:'Employee Advance',category:'General Advance',min:10001,max:50000,primary:'Virendra Tripathi',secondary:'Narendra Shukla',docs:'Request form + purpose',turnaround:'2 Working Days',escalation:'Sandhya Tripathi',notes:'Review outstanding balance'},
       {id:uid(),reqType:'Employee Advance',category:'General Advance',min:50001,max:99999999,primary:'Sandhya Tripathi',secondary:'Virendra Tripathi',docs:'Request form + purpose + management note',turnaround:'3 Working Days',escalation:'Sandhya Tripathi',notes:'Management approval required'},
       {id:uid(),reqType:'Claim Reimbursement',category:'Travel / Fuel',min:0,max:10000,primary:'Narendra Shukla',secondary:'',docs:'Bills + travel details',turnaround:'2 Working Days',escalation:'Virendra Tripathi',notes:'Original supporting bills'},
       {id:uid(),reqType:'Claim Reimbursement',category:'Food / Hotel',min:0,max:10000,primary:'Narendra Shukla',secondary:'',docs:'Bills + business purpose',turnaround:'2 Working Days',escalation:'Virendra Tripathi',notes:'Business purpose mandatory'},
-    ], payroll: [],
+    ],
+    payroll: [],
   };
 }
 
 async function loadAll(){
   const seed = seedData();
-  const failSafe = new Promise(resolve=>setTimeout(()=>resolve(null), 15000));
-  const loaded = await Promise.race([Promise.all(KEYS.map(k => loadKey(k, null))), failSafe]);
-  if(!loaded){
-    DB = seed;
-    console.warn('Database request timed out; showing local seed data. Check Supabase permissions/network.');
-    return;
-  }
+  const loaded = await Promise.all(KEYS.map(k => loadKey(k, null)));
   KEYS.forEach((k, i) => { DB[k] = loaded[i]; });
+  // first run: seed
   if(!DB.meta){
     DB = seed;
-    for(const k of KEYS) await saveKey(k);
+    await Promise.all(KEYS.map(k => saveKey(k)));
   } else {
     for(const k of KEYS){ if(DB[k]==null) DB[k] = seed[k]; }
     if(!DB.meta.companyGstin || DB.meta.companyGstin==='09AAYCS4927P2Z2'){ DB.meta.companyGstin = seed.meta.companyGstin; await saveKey('meta'); }
-    if(Array.isArray(DB.approvalMatrix) && DB.approvalMatrix.length===0 && seed.approvalMatrix.length){
-      DB.approvalMatrix = seed.approvalMatrix;
-      await saveKey('approvalMatrix');
-    }
   }
 }
 
@@ -1074,7 +980,7 @@ function viewAttStatus(){
     ${DB.employees.length===0 ? '<div class="empty">Add employees under More → Employees first.</div>' : `
     <div class="tbl-wrap"><table><thead><tr><th>Employee</th><th>Status</th><th>Day Salary</th></tr></thead><tbody>
       ${DB.employees.filter(x=>x.status!=='Inactive').map(emp=>{
-        const rec = dayRows.find(a=>a.empId===emp.id || a.empId===emp.empId);
+        const rec = dayRows.find(a=>a.empId===emp.id);
         const status = rec ? rec.status : '';
         const factor = status==='P'?1:status==='H'?0.5:0;
         const daySalary = hasSales ? (emp.salary/DB.meta.workingDays*factor) : 0;
@@ -1082,7 +988,7 @@ function viewAttStatus(){
           return `<tr><td>${esc(emp.name)}</td><td><span class="tag tag-navy">Sunday</span></td><td class="num">—</td></tr>`;
         }
         return `<tr><td>${esc(emp.name)}</td><td>
-          <select onchange="setAttendance('${emp.empId || emp.id}', this.value)">
+          <select onchange="setAttendance('${emp.id}', this.value)">
             <option value="">—</option>
             <option value="P" ${status==='P'?'selected':''}>Present</option>
             <option value="H" ${status==='H'?'selected':''}>Half-day</option>
@@ -1097,10 +1003,8 @@ function viewAttStatus(){
 }
 async function setAttendance(empId, status){
   if(isSunday(attDate)){ toast('Sunday is a weekly off — attendance is not marked'); return; }
-  const emp = DB.employees.find(e=>e.id===empId || e.empId===empId);
-  const employeeKey = emp ? (emp.empId || emp.id) : empId;
-  DB.attendance = DB.attendance.filter(a=>!(a.date===attDate && (a.empId===employeeKey || a.empId===empId || (emp && a.empId===emp.id))));
-  if(status) DB.attendance.push({id:uid(), date:attDate, empId:employeeKey, status});
+  DB.attendance = DB.attendance.filter(a=>!(a.date===attDate && a.empId===empId));
+  if(status) DB.attendance.push({id:uid(), date:attDate, empId, status});
   await saveKey('attendance'); render();
 }
 window.setAttendance = setAttendance;
@@ -1121,16 +1025,16 @@ function viewTimeLog(){
         if(sunday){
           return `<tr><td>${esc(emp.name)}</td><td colspan="6"><span class="tag tag-navy">Sunday</span></td></tr>`;
         }
-        const rec = dayRows.find(t=>t.empId===emp.id || t.empId===emp.empId) || {};
+        const rec = dayRows.find(t=>t.empId===emp.id) || {};
         const c = computeTimeLog(rec.checkIn);
         const needsApproval = c.phaStatus==='H' || c.phaStatus==='A';
         return `<tr>
           <td>${esc(emp.name)}</td>
-          <td><input type="time" value="${rec.checkIn||''}" onchange="setTimeLogCheckIn('${emp.empId || emp.id}', this.value)" style="min-width:110px;"></td>
+          <td><input type="time" value="${rec.checkIn||''}" onchange="setTimeLogCheckIn('${emp.id}', this.value)" style="min-width:110px;"></td>
           <td class="num">${decToTimeLabel(c.hoursWorked)}</td>
           <td>${attStatusTag(c.attStatus)}</td>
           <td class="num">${c.overtime===''?'—':c.overtime.toFixed(2)}</td>
-          <td>${needsApproval ? `<select onchange="setTimeLogApproval('${emp.empId || emp.id}', this.value)">
+          <td>${needsApproval ? `<select onchange="setTimeLogApproval('${emp.id}', this.value)">
               <option value="" ${!rec.approval?'selected':''}>Pending</option>
               <option value="Approved" ${rec.approval==='Approved'?'selected':''}>Approved</option>
               <option value="Rejected" ${rec.approval==='Rejected'?'selected':''}>Rejected</option>
@@ -1155,28 +1059,23 @@ function attStatusTag(s){
 }
 async function setTimeLogCheckIn(empId, val){
   if(isSunday(attDate)){ toast('Sunday is a weekly off — check-in is not recorded'); render(); return; }
-  const emp = DB.employees.find(e=>e.id===empId || e.empId===empId);
-  const employeeKey = emp ? (emp.empId || emp.id) : empId;
-  DB.timelog = DB.timelog.filter(t=>!(t.date===attDate && (t.empId===employeeKey || t.empId===empId || (emp && t.empId===emp.id))));
-  DB.timelog.push({id:uid(), date:attDate, empId:employeeKey, checkIn:val||'', approval:''});
+  DB.timelog = DB.timelog.filter(t=>!(t.date===attDate && t.empId===empId));
+  DB.timelog.push({id:uid(), date:attDate, empId, checkIn:val||'', approval:''});
   await saveKey('timelog'); render();
 }
 async function setTimeLogApproval(empId, val){
-  const emp = DB.employees.find(e=>e.id===empId || e.empId===empId);
-  const employeeKey = emp ? (emp.empId || emp.id) : empId;
-  const rec = DB.timelog.find(t=>t.date===attDate && (t.empId===employeeKey || t.empId===empId || (emp && t.empId===emp.id)));
+  const rec = DB.timelog.find(t=>t.date===attDate && t.empId===empId);
   if(rec){ rec.approval = val; await saveKey('timelog'); render(); }
 }
 async function syncTimeLogToAttendance(){
   if(isSunday(attDate)){ toast('Sunday is a weekly off — nothing to sync'); return; }
   DB.employees.filter(x=>x.status!=='Inactive').forEach(emp=>{
-    const rec = DB.timelog.find(t=>t.date===attDate && (t.empId===emp.id || t.empId===emp.empId));
+    const rec = DB.timelog.find(t=>t.date===attDate && t.empId===emp.id);
     const c = computeTimeLog(rec ? rec.checkIn : '');
     let status = c.phaStatus;
     if((c.phaStatus==='H' || c.phaStatus==='A') && rec && rec.approval==='Approved') status = 'P';
-    const employeeKey = emp.empId || emp.id;
-    DB.attendance = DB.attendance.filter(a=>!(a.date===attDate && (a.empId===emp.id || a.empId===employeeKey)));
-    DB.attendance.push({id:uid(), date:attDate, empId:employeeKey, status});
+    DB.attendance = DB.attendance.filter(a=>!(a.date===attDate && a.empId===emp.id));
+    DB.attendance.push({id:uid(), date:attDate, empId:emp.id, status});
   });
   await saveKey('attendance'); toast('Synced to Daily Status'); attView='status'; render();
 }
